@@ -99,11 +99,18 @@ pub fn occupancy_or_fallback(
 
 /// Feed the latest frame to the FieldModel during calibration collection.
 ///
-/// Only acts when the model status is `Collecting`. Wraps the latest frame
-/// as a single-link observation (n_links=1) and feeds it.
+/// Acts while the model is `Uncalibrated` or `Collecting` (the first feed
+/// transitions `Uncalibrated -> Collecting`), and is a no-op once the baseline
+/// is finalised. Wraps the latest frame as a single-link observation (n_links=1).
 pub fn maybe_feed_calibration(field: &mut FieldModel, frame_history: &VecDeque<Vec<f64>>) {
-    if field.status() != CalibrationStatus::Collecting {
-        return;
+    // Feed while Uncalibrated OR Collecting. The first feed is what transitions
+    // Uncalibrated -> Collecting (see FieldModel::feed_calibration), so gating on
+    // `== Collecting` here dead-locked calibration at 0 frames: it waited to be
+    // Collecting before feeding, but feeding is the only thing that sets
+    // Collecting. Stop feeding once the baseline is finalised (Fresh, etc.).
+    match field.status() {
+        CalibrationStatus::Uncalibrated | CalibrationStatus::Collecting => {}
+        _ => return,
     }
     if let Some(latest) = frame_history.back() {
         // Single-link observation: [1][n_subcarriers]
