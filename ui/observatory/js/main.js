@@ -398,7 +398,7 @@ class Observatory {
         shell.position.copy(m.scenePos);
         shell.position.y += 0.3;
         this._scene.add(shell);
-        this._wifiWaves.push({ mesh: shell, mat, phase: ni * 0.5 + i * 0.7 });
+        this._wifiWaves.push({ mesh: shell, mat, phase: ni * 0.5 + i * 0.7, nodeId: m.nodeId });
       }
     });
   }
@@ -654,6 +654,12 @@ class Observatory {
     }
     const data = this._currentData;
 
+    // Connected node ids from the live feed (null on demo / no nodes array).
+    // Stored on `this` so both the wave updater and the marker loop gate on it.
+    this._connIds = (data && Array.isArray(data.nodes))
+      ? new Set(data.nodes.map(n => n.node_id))
+      : null;
+
     // Updates (guarded: a single updater throwing on an unexpected live-data
     // shape must not abort the frame — otherwise controls/render below are
     // skipped and the page freezes).
@@ -677,9 +683,7 @@ class Observatory {
     // Node markers: pulse LEDs, and show ONLY nodes present in the live feed
     // (data.nodes[].node_id). With no live data (demo), show all configured.
     if (this._nodeMarkers) {
-      const connIds = (data && Array.isArray(data.nodes))
-        ? new Set(data.nodes.map(n => n.node_id))
-        : null;
+      const connIds = this._connIds;
       for (let i = 0; i < this._nodeMarkers.length; i++) {
         const m = this._nodeMarkers[i];
         if (connIds) m.group.visible = connIds.has(m.nodeId);
@@ -801,7 +805,11 @@ class Observatory {
   // ---- WiFi Waves ----
 
   _updateWifiWaves(elapsed) {
+    const conn = this._connIds;
     for (const w of this._wifiWaves) {
+      // Hide ripples for nodes not in the live feed (matches marker gating).
+      if (conn && !conn.has(w.nodeId)) { w.mat.opacity = 0; w.mesh.visible = false; continue; }
+      w.mesh.visible = true;
       const t = (elapsed * 0.9 + w.phase) % 3.5;
       const life = t / 3.5;
       // Subtle ripple — smaller opacity since markers are densely placed
