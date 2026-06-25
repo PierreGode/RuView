@@ -30,11 +30,22 @@ const ENERGY_THRESH_3: f64 = 25.0;
 /// reliable — genuine higher counts come from the multistatic fusion path.
 const MAX_SINGLE_LINK_OCCUPANCY: usize = 3;
 
-/// Create a FieldModelConfig for single-link mode (one ESP32 node = one link).
-/// This avoids the DimensionMismatch error when feeding single-frame observations.
-pub fn single_link_config() -> FieldModelConfig {
+/// Create a FieldModelConfig for single-link mode (one ESP32 node = one link),
+/// sized to the actual CSI subcarrier width of the frames that will be fed.
+///
+/// `n_subcarriers` MUST equal the width of the incoming CSI frames (ESP32-S3
+/// HT40 = 256, ESP32-C6 = 64, ...). The previous code left this at the
+/// `FieldModelConfig::default()` value of 56, so `feed_calibration` rejected
+/// every real frame and calibration never collected anything.
+///
+/// Also lowers `min_calibration_frames` from the 12_000 long-baseline default
+/// to a value suitable for an interactive (~10-30 s) empty-room baseline,
+/// otherwise `/calibration/stop` can never finalise.
+pub fn single_link_config(n_subcarriers: usize) -> FieldModelConfig {
     FieldModelConfig {
         n_links: 1,
+        n_subcarriers,
+        min_calibration_frames: 200,
         ..FieldModelConfig::default()
     }
 }
@@ -99,13 +110,26 @@ pub fn occupancy_or_fallback(
 
 /// Feed the latest frame to the FieldModel during calibration collection.
 ///
-/// Only acts when the model status is `Collecting`. Wraps the latest frame
-/// as a single-link observation (n_links=1) and feeds it.
+/// Acts while the model is `Uncalibrated` or `Collecting` (the first feed
+/// transitions `Uncalibrated -> Collecting`), and is a no-op once the baseline
+/// is finalised. Wraps the latest frame as a single-link observation (n_links=1).
 pub fn maybe_feed_calibration(field: &mut FieldModel, frame_history: &VecDeque<Vec<f64>>) {
-    if field.status() != CalibrationStatus::Collecting {
-        return;
+    // Feed while Uncalibrated OR Collecting. The first feed is what transitions
+    // Uncalibrated -> Collecting (see FieldModel::feed_calibration), so gating on
+    // `== Collecting` here dead-locked calibration at 0 frames: it waited to be
+    // Collecting before feeding, but feeding is the only thing that sets
+    // Collecting. Stop feeding once the baseline is finalised (Fresh, etc.).
+    match field.status() {
+        CalibrationStatus::Uncalibrated | CalibrationStatus::Collecting => {}
+        _ => return,
     }
     if let Some(latest) = frame_history.back() {
+        // Heterogeneous nodes (S3=256, C6=64) feed into one single-link model;
+        // only frames matching the configured width are valid (feed_calibration
+        // would reject the rest with DimensionMismatch). Skip mismatches.
+        if latest.len() != field.n_subcarriers() {
+            return;
+        }
         // Single-link observation: [1][n_subcarriers]
         let observations = vec![latest.clone()];
         if let Err(e) = field.feed_calibration(&observations) {

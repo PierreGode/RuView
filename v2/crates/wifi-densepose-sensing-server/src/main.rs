@@ -4923,12 +4923,36 @@ async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json:
             _ => {} // Stale/Expired/Uncalibrated — ok to recalibrate
         }
     }
-    match FieldModel::new(field_bridge::single_link_config()) {
+    // Size the FieldModel to the actual live CSI subcarrier width — without this
+    // it defaults to 56 and feed_calibration rejects every real ESP32 frame
+    // (S3 HT40 = 256, C6 = 64). With heterogeneous nodes, pick the most common
+    // width so the largest matched set contributes; mismatched frames are skipped
+    // in maybe_feed_calibration.
+    let detected_width = {
+        let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for ns in s.node_states.values() {
+            if let Some(latest) = ns.frame_history.back() {
+                if !latest.is_empty() {
+                    *counts.entry(latest.len()).or_insert(0) += 1;
+                }
+            }
+        }
+        counts.into_iter().max_by_key(|&(_, c)| c).map(|(w, _)| w)
+    };
+    let Some(width) = detected_width else {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "No CSI frames yet — ensure at least one node is streaming before calibrating.",
+        }));
+    };
+    match FieldModel::new(field_bridge::single_link_config(width)) {
         Ok(fm) => {
             s.field_model = Some(fm);
             Json(serde_json::json!({
                 "success": true,
-                "message": "Calibration started — keep room empty while frames accumulate.",
+                "message": format!(
+                    "Calibration started ({width}-subcarrier link) — keep the room empty while ~200 frames accumulate."
+                ),
             }))
         }
         // ADR-080 #2: FieldModel init error chain stays server-side only.
@@ -7558,7 +7582,11 @@ async fn main() {
         ),
         field_model: if args.calibrate {
             info!("Field model calibration enabled — room should be empty during startup");
-            FieldModel::new(field_bridge::single_link_config()).ok()
+            // No frames at boot, so width is unknown here; default to the common
+            // 64-subcarrier (HT20 / ESP32-C6) width. The runtime API path
+            // (/api/v1/calibration/start) sizes the model to the live width
+            // instead — prefer that for mixed/HT40 (256-wide) deployments.
+            FieldModel::new(field_bridge::single_link_config(64)).ok()
         } else {
             None
         },
