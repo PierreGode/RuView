@@ -2021,7 +2021,7 @@ fn extract_features_from_frame(
     // `smooth_and_classify()` which has access to EMA state and hysteresis.
     let raw_classification = ClassificationInfo {
         motion_level: raw_classify(motion_score),
-        presence: motion_score > 0.04,
+        presence: motion_score > csi::presence_floor(),
         confidence: (0.4 + signal_quality * 0.3 + motion_score * 0.3).clamp(0.0, 1.0),
     };
 
@@ -2035,12 +2035,16 @@ fn extract_features_from_frame(
 }
 
 /// Simple threshold classification (no smoothing) — used as the "raw" input.
+/// Bands are rebased on `csi::presence_floor()` (env `RUVIEW_PRESENCE_FLOOR`)
+/// so the empty-room noise floor can be tuned per environment; the +0.08/+0.21
+/// offsets preserve the original band widths.
 fn raw_classify(score: f64) -> String {
-    if score > 0.25 {
+    let f = csi::presence_floor();
+    if score > f + 0.21 {
         "active".into()
-    } else if score > 0.12 {
+    } else if score > f + 0.08 {
         "present_moving".into()
-    } else if score > 0.04 {
+    } else if score > f {
         "present_still".into()
     } else {
         "absent".into()
@@ -2102,7 +2106,7 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
 
     // 6. Write the smoothed result back into the classification.
     raw.motion_level = state.current_motion_level.clone();
-    raw.presence = sm > 0.03;
+    raw.presence = sm > csi::presence_floor();
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
@@ -2140,7 +2144,7 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
     }
 
     raw.motion_level = ns.current_motion_level.clone();
-    raw.presence = sm > 0.03;
+    raw.presence = sm > csi::presence_floor();
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
@@ -2194,6 +2198,13 @@ const BR_DEAD_BAND: f64 = 0.5;
 /// Mutates `state.smoothed_hr`, `state.smoothed_br`, etc.
 /// Returns the smoothed VitalSigns to broadcast.
 fn smooth_vitals(state: &mut AppStateInner, raw: &VitalSigns) -> VitalSigns {
+    // Gate on presence: with no one in the scene (smoothed motion below the
+    // tunable floor) any HR/RR is noise the extractor latched onto. Emit empty
+    // vitals so the UI doesn't show phantom heart/breathing rates on an empty
+    // room. Uses the same floor as the presence decision.
+    if state.smoothed_motion <= csi::presence_floor() {
+        return VitalSigns::default();
+    }
     let raw_hr = raw.heart_rate_bpm.unwrap_or(0.0);
     let raw_br = raw.breathing_rate_bpm.unwrap_or(0.0);
 
@@ -2264,6 +2275,10 @@ fn smooth_vitals(state: &mut AppStateInner, raw: &VitalSigns) -> VitalSigns {
 
 /// Per-node variant of `smooth_vitals` that operates on a `NodeState` (issue #249).
 fn smooth_vitals_node(ns: &mut NodeState, raw: &VitalSigns) -> VitalSigns {
+    // Gate on presence (see smooth_vitals): no presence -> no vitals.
+    if ns.smoothed_motion <= csi::presence_floor() {
+        return VitalSigns::default();
+    }
     let raw_hr = raw.heart_rate_bpm.unwrap_or(0.0);
     let raw_br = raw.breathing_rate_bpm.unwrap_or(0.0);
 
@@ -4083,6 +4098,16 @@ fn emit_rufield_event(s: &AppStateInner, update: &SensingUpdate, node_id: u8) {
 }
 
 fn attach_field_positions(update: &mut SensingUpdate) {
+    // Presence gate for the Observatory floor heatmap. When nobody is present
+    // the signal field is just CSI noise, but generate_signal_field's per-frame
+    // max-normalisation stretches that noise to full [0,1] scale, so the floor
+    // squares flicker hard on an empty room. Zero the field when absent so it
+    // renders calm. Runs on every publish path (this is the shared chokepoint).
+    if !update.classification.presence {
+        for v in update.signal_field.values.iter_mut() {
+            *v = 0.0;
+        }
+    }
     let Some(persons) = update.persons.as_mut() else {
         return;
     };
