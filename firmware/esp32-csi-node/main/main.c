@@ -487,6 +487,13 @@ void app_main(void)
 #else
     bool has_display = false;                 /* display support not compiled in */
 #endif
+#if CONFIG_DISPLAY_PANEL_ST7789
+    /* The ST7789 (Waveshare 1.47") is a light 1-line SPI panel (~1 MB/s) on a
+     * dedicated SPI host — it does NOT cause the QSPI/flash-cache contention the
+     * MGMT-only workaround (RuView#396/#893) was guarding the AMOLED against. So
+     * keep full MGMT+DATA capture for proper CSI yield even with the display on. */
+    has_display = false;
+#endif
     if (!has_display) {
         csi_collector_enable_data_capture();
     }
