@@ -36,7 +36,7 @@ export const DEFAULTS = {
   ],
 };
 
-export const SETTINGS_VERSION = '7';
+export const SETTINGS_VERSION = '8';
 
 export const PRESETS = {
   foundation: {},
