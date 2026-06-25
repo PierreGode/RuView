@@ -650,25 +650,47 @@ class Observatory {
 
   _connectWS(url) {
     this._disconnectWS();
+    this._wsUrl = url;
+    this._wsShouldRun = true;   // keep reconnecting until explicitly disconnected
     try {
-      this._ws = new WebSocket(url);
-      this._ws.onopen = () => {
+      const ws = new WebSocket(url);
+      this._ws = ws;
+      ws.onopen = () => {
+        this._wsRetry = 0;
         console.log('[Observatory] WebSocket connected');
-        this._hud.updateSourceBadge('ws', this._ws);
+        this._hud.updateSourceBadge('ws', ws);
       };
-      this._ws.onmessage = (evt) => { try { this._liveData = JSON.parse(evt.data); } catch {} };
-      this._ws.onclose = () => {
-        console.log('[Observatory] WebSocket closed, falling back to demo');
+      ws.onmessage = (evt) => { try { this._liveData = JSON.parse(evt.data); } catch {} };
+      ws.onclose = () => {
         this._ws = null;
-        this.settings.dataSource = 'demo';
-        this._hud.updateSourceBadge('demo', null);
+        this._liveData = null;              // drop stale frame; stay in 'ws' mode
+        this._hud.updateSourceBadge('ws', null);
+        // Auto-reconnect with backoff so transient drops / server restarts
+        // recover on their own — new nodes keep appearing without a reload.
+        if (this._wsShouldRun) {
+          const n = this._wsRetry || 0;
+          const delay = Math.min(1000 * Math.pow(2, n), 15000);
+          this._wsRetry = n + 1;
+          console.log('[Observatory] WebSocket closed — reconnecting in', delay, 'ms');
+          clearTimeout(this._wsReconnectTimer);
+          this._wsReconnectTimer = setTimeout(() => {
+            if (this._wsShouldRun) this._connectWS(this._wsUrl);
+          }, delay);
+        }
       };
-      this._ws.onerror = () => {};
-    } catch {}
+      ws.onerror = () => {};
+    } catch {
+      if (this._wsShouldRun) {
+        clearTimeout(this._wsReconnectTimer);
+        this._wsReconnectTimer = setTimeout(() => this._connectWS(url), 3000);
+      }
+    }
   }
 
   _disconnectWS() {
-    if (this._ws) { this._ws.close(); this._ws = null; }
+    this._wsShouldRun = false;
+    clearTimeout(this._wsReconnectTimer);
+    if (this._ws) { try { this._ws.close(); } catch {} this._ws = null; }
     this._liveData = null;
   }
 
