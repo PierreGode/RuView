@@ -33,12 +33,18 @@ const C = {
 
 // SCENARIO_NAMES, DEFAULTS, SETTINGS_VERSION, PRESETS imported from hud-controller.js
 
+// Scene floor footprint (units). Configured room dimensions (metres) are
+// mapped to fit this footprint, centered on the scene origin.
+const FLOOR_W = 12; // scene units along X
+const FLOOR_D = 10; // scene units along Z
+const ROOM_H = 4;   // scene units (wall height for room wireframe)
+
 // ---- Main Class ----
 
 class Observatory {
   constructor() {
     this._canvas = document.getElementById('observatory-canvas');
-    this.settings = { ...DEFAULTS };
+    this.settings = { ...DEFAULTS, nodes: DEFAULTS.nodes.map(n => ({ ...n })) };
 
     // Load saved settings
     try {
@@ -102,7 +108,7 @@ class Observatory {
     this._setupLighting();
     this._nebula = new NebulaBackground(this._scene);
     this._buildRoom();
-    this._buildRouter();
+    this._buildNodes();
     this._poseSystem = new PoseSystem();
     this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
     this._scenarioProps = new ScenarioProps(this._scene);
@@ -182,21 +188,22 @@ class Observatory {
   // ---- Room ----
 
   _buildRoom() {
-    this._grid = new THREE.GridHelper(12, 24, 0x1a4830, 0x0c2818);
+    // Grid sized to floor footprint, divisions ≈ 1 per scene unit
+    this._grid = new THREE.GridHelper(FLOOR_W, 24, 0x1a4830, 0x0c2818);
     this._grid.material.opacity = 0.5;
     this._grid.material.transparent = true;
     this._scene.add(this._grid);
 
-    const boxGeo = new THREE.BoxGeometry(12, 4, 10);
+    const boxGeo = new THREE.BoxGeometry(FLOOR_W, ROOM_H, FLOOR_D);
     const edges = new THREE.EdgesGeometry(boxGeo);
     this._roomWire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
       color: C.greenDim, opacity: 0.3, transparent: true,
     }));
-    this._roomWire.position.y = 2;
+    this._roomWire.position.y = ROOM_H / 2;
     this._scene.add(this._roomWire);
 
     // Reflective floor
-    const floorGeo = new THREE.PlaneGeometry(12, 10);
+    const floorGeo = new THREE.PlaneGeometry(FLOOR_W, FLOOR_D);
     this._floorMat = new THREE.MeshStandardMaterial({
       color: 0x101810,
       roughness: 1.0 - this.settings.reflect * 0.7,
@@ -209,66 +216,190 @@ class Observatory {
     floor.receiveShadow = true;
     this._scene.add(floor);
 
-    // Table under router
-    const tableGeo = new THREE.BoxGeometry(0.8, 0.6, 0.5);
-    const tableMat = new THREE.MeshStandardMaterial({ color: 0x6b5840, roughness: 0.55, emissive: 0x1a1408, emissiveIntensity: 0.25 });
-    const table = new THREE.Mesh(tableGeo, tableMat);
-    table.position.set(-4, 0.3, -3);
-    table.castShadow = true;
-    this._scene.add(table);
+    // Dimension label sprites along the floor edges (rebuilt on dim change)
+    this._roomDimGroup = new THREE.Group();
+    this._scene.add(this._roomDimGroup);
+    this._refreshRoomDimLabels();
   }
 
-  // ---- Router ----
+  // ---- Coordinate mapping (real metres → scene units) ----
+  //
+  // Room is centered on the scene origin. Node X (0..roomX) spans the floor
+  // width, node Y (0..roomY) spans the floor depth, node Z is height in metres
+  // (used directly as scene Y, since 1 unit ≈ 1 m vertically).
+  _roomDims() {
+    let rx = parseFloat(this.settings.roomX);
+    let ry = parseFloat(this.settings.roomY);
+    if (!Number.isFinite(rx) || rx <= 0) rx = DEFAULTS.roomX;
+    if (!Number.isFinite(ry) || ry <= 0) ry = DEFAULTS.roomY;
+    return { rx, ry };
+  }
 
-  _buildRouter() {
-    this._routerGroup = new THREE.Group();
-    this._routerGroup.position.set(-4, 0.92, -3);
+  _roomToScene(mx, my, mz) {
+    const { rx, ry } = this._roomDims();
+    const x = Number.isFinite(mx) ? mx : 0;
+    const y = Number.isFinite(my) ? my : 0;
+    const z = Number.isFinite(mz) ? mz : 1.0;
+    return new THREE.Vector3(
+      (x / rx - 0.5) * FLOOR_W,
+      z,
+      (y / ry - 0.5) * FLOOR_D
+    );
+  }
 
-    const bodyGeo = new THREE.BoxGeometry(0.6, 0.12, 0.35);
-    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x505060, roughness: 0.2, metalness: 0.7, emissive: 0x101018, emissiveIntensity: 0.2 });
-    this._routerGroup.add(new THREE.Mesh(bodyGeo, bodyMat));
-
-    for (let i = -1; i <= 1; i++) {
-      const antGeo = new THREE.CylinderGeometry(0.015, 0.015, 0.35);
-      const antMat = new THREE.MeshStandardMaterial({ color: 0x606068, roughness: 0.3, metalness: 0.6, emissive: 0x101018, emissiveIntensity: 0.15 });
-      const ant = new THREE.Mesh(antGeo, antMat);
-      ant.position.set(i * 0.2, 0.24, 0);
-      ant.rotation.z = i * 0.15;
-      this._routerGroup.add(ant);
+  _refreshRoomDimLabels() {
+    if (!this._roomDimGroup) return;
+    while (this._roomDimGroup.children.length) {
+      const c = this._roomDimGroup.children.pop();
+      if (c.material) { c.material.map?.dispose(); c.material.dispose(); }
     }
-
-    const ledGeo = new THREE.SphereGeometry(0.025);
-    this._routerLed = new THREE.Mesh(ledGeo, new THREE.MeshBasicMaterial({ color: C.greenGlow }));
-    this._routerLed.position.set(0.22, 0.07, 0.18);
-    this._routerGroup.add(this._routerLed);
-
-    this._routerLight = new THREE.PointLight(C.blueSignal, 1.2, 8);
-    this._routerLight.position.set(0, 0.3, 0);
-    this._routerGroup.add(this._routerLight);
-
-    this._scene.add(this._routerGroup);
+    const { rx, ry } = this._roomDims();
+    const wLabel = this._makeLabelSprite(`${rx.toFixed(1)} m`, '#3eff8a');
+    wLabel.position.set(0, 0.05, FLOOR_D / 2 + 0.5);
+    wLabel.scale.set(1.4, 0.35, 1);
+    this._roomDimGroup.add(wLabel);
+    const dLabel = this._makeLabelSprite(`${ry.toFixed(1)} m`, '#3eff8a');
+    dLabel.position.set(FLOOR_W / 2 + 0.5, 0.05, 0);
+    dLabel.scale.set(1.4, 0.35, 1);
+    this._roomDimGroup.add(dLabel);
   }
 
-  // ---- WiFi Waves ----
+  // ---- Sensor Nodes ----
+
+  _safeNodes() {
+    let nodes = this.settings.nodes;
+    if (!Array.isArray(nodes) || nodes.length === 0) {
+      nodes = DEFAULTS.nodes.map(n => ({ ...n }));
+      this.settings.nodes = nodes;
+    }
+    return nodes;
+  }
+
+  _buildNodes() {
+    this._nodeGroup = new THREE.Group();
+    this._scene.add(this._nodeGroup);
+    this._nodeMarkers = [];
+
+    const nodes = this._safeNodes();
+    nodes.forEach((node, i) => {
+      const def = DEFAULTS.nodes[i] || DEFAULTS.nodes[0];
+      const g = new THREE.Group();
+      const p = this._roomToScene(node.x ?? def.x, node.y ?? def.y, node.z ?? def.z);
+      g.position.copy(p);
+
+      // Emissive marker box
+      const boxGeo = new THREE.BoxGeometry(0.28, 0.12, 0.2);
+      const boxMat = new THREE.MeshStandardMaterial({
+        color: 0x303848, roughness: 0.3, metalness: 0.6,
+        emissive: C.blueSignal, emissiveIntensity: 0.6,
+      });
+      g.add(new THREE.Mesh(boxGeo, boxMat));
+
+      // Short vertical antenna
+      const antGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.3);
+      const antMat = new THREE.MeshStandardMaterial({
+        color: 0x90b0ff, roughness: 0.3, metalness: 0.6,
+        emissive: C.blueSignal, emissiveIntensity: 0.4,
+      });
+      const ant = new THREE.Mesh(antGeo, antMat);
+      ant.position.set(0, 0.21, 0);
+      g.add(ant);
+
+      // Pulsing LED tip
+      const led = new THREE.Mesh(
+        new THREE.SphereGeometry(0.03),
+        new THREE.MeshBasicMaterial({ color: C.greenGlow })
+      );
+      led.position.set(0, 0.37, 0);
+      g.add(led);
+
+      // Point light for local glow
+      const light = new THREE.PointLight(C.blueSignal, 0.8, 4);
+      light.position.set(0, 0.3, 0);
+      g.add(light);
+
+      // Floating text label
+      const label = this._makeLabelSprite(node.label || def.label || `Node ${i + 1}`, '#90c0ff');
+      label.position.set(0, 0.7, 0);
+      label.scale.set(1.6, 0.4, 1);
+      g.add(label);
+
+      this._nodeGroup.add(g);
+      this._nodeMarkers.push({ group: g, led, light, scenePos: p.clone() });
+    });
+  }
+
+  // Build a CanvasTexture text sprite for a node/dimension label
+  _makeLabelSprite(text, color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, 256, 64);
+    ctx.font = 'bold 30px "JetBrains Mono", monospace';
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 8;
+    ctx.fillText(text, 128, 34);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+    const mat = new THREE.SpriteMaterial({
+      map: tex, transparent: true, depthWrite: false, depthTest: false,
+    });
+    return new THREE.Sprite(mat);
+  }
+
+  // Live re-place room + node markers when settings change (no reload)
+  _rebuildRoomAndNodes() {
+    this._refreshRoomDimLabels();
+    if (this._nodeGroup) {
+      this._scene.remove(this._nodeGroup);
+      this._nodeGroup.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) { o.material.map?.dispose(); o.material.dispose(); }
+      });
+    }
+    this._buildNodes();
+    this._rebuildWifiWaves();
+  }
+
+  // ---- WiFi Waves (one ripple set per node) ----
 
   _buildWifiWaves() {
     this._wifiWaves = [];
-    for (let i = 0; i < 5; i++) {
-      const radius = 0.8 + i * 1.0;
-      const geo = new THREE.SphereGeometry(radius, 24, 16, 0, Math.PI * 2, 0, Math.PI * 0.6);
-      const mat = new THREE.MeshBasicMaterial({
-        color: C.blueSignal,
-        transparent: true, opacity: 0,
-        side: THREE.DoubleSide,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false, wireframe: true,
-      });
-      const shell = new THREE.Mesh(geo, mat);
-      shell.position.copy(this._routerGroup.position);
-      shell.position.y += 0.5;
-      this._scene.add(shell);
-      this._wifiWaves.push({ mesh: shell, mat, phase: i * 0.7 });
+    this._rebuildWifiWaves();
+  }
+
+  _rebuildWifiWaves() {
+    // Dispose any existing wave shells
+    if (this._wifiWaves) {
+      for (const w of this._wifiWaves) {
+        this._scene.remove(w.mesh);
+        w.mesh.geometry.dispose();
+        w.mat.dispose();
+      }
     }
+    this._wifiWaves = [];
+    const markers = this._nodeMarkers || [];
+    markers.forEach((m, ni) => {
+      for (let i = 0; i < 3; i++) {
+        const radius = 0.3 + i * 0.35;
+        const geo = new THREE.SphereGeometry(radius, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.6);
+        const mat = new THREE.MeshBasicMaterial({
+          color: C.blueSignal,
+          transparent: true, opacity: 0,
+          side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false, wireframe: true,
+        });
+        const shell = new THREE.Mesh(geo, mat);
+        shell.position.copy(m.scenePos);
+        shell.position.y += 0.3;
+        this._scene.add(shell);
+        this._wifiWaves.push({ mesh: shell, mat, phase: ni * 0.5 + i * 0.7 });
+      }
+    });
   }
 
   // ========================================
@@ -436,6 +567,15 @@ class Observatory {
   // ---- WebSocket live data ----
 
   _autoDetectLive() {
+    // If the user defaults to (or has selected) live WS, connect to the
+    // page's own host /ws/sensing immediately. Falls back to demo on close.
+    if (this.settings.dataSource === 'ws') {
+      const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = this.settings.wsUrl ||
+        `${wsProto}//${window.location.host}/ws/sensing`;
+      this.settings.wsUrl = wsUrl;
+      this._connectWS(wsUrl);
+    }
     // Probe sensing server health on same origin, then common ports
     const host = window.location.hostname || 'localhost';
     const candidates = [
@@ -524,9 +664,15 @@ class Observatory {
     this._hud.updateHUD(data, this._demoData);
     this._hud.updateSparkline(data);
 
-    // Router LED
-    this._routerLed.material.opacity = 0.5 + 0.5 * Math.sin(elapsed * 8);
-    this._routerLight.intensity = 0.3 + 0.2 * Math.sin(elapsed * 3);
+    // Node LEDs pulse
+    if (this._nodeMarkers) {
+      for (let i = 0; i < this._nodeMarkers.length; i++) {
+        const m = this._nodeMarkers[i];
+        const ph = i * 1.3;
+        m.led.material.opacity = 0.5 + 0.5 * Math.sin(elapsed * 8 + ph);
+        m.light.intensity = 0.4 + 0.3 * Math.sin(elapsed * 3 + ph);
+      }
+    }
 
     // Autopilot orbit
     if (this._autopilot) {
@@ -641,10 +787,11 @@ class Observatory {
 
   _updateWifiWaves(elapsed) {
     for (const w of this._wifiWaves) {
-      const t = (elapsed * 0.8 + w.phase) % 4.5;
-      const life = t / 4.5;
-      w.mat.opacity = Math.max(0, this.settings.waves * 0.25 * (1 - life));
-      const scale = 1 + life * 0.6;
+      const t = (elapsed * 0.9 + w.phase) % 3.5;
+      const life = t / 3.5;
+      // Subtle ripple — smaller opacity since markers are densely placed
+      w.mat.opacity = Math.max(0, this.settings.waves * 0.18 * (1 - life));
+      const scale = 1 + life * 1.2;
       w.mesh.scale.set(scale, scale, scale);
       w.mesh.rotation.y = elapsed * 0.05;
     }

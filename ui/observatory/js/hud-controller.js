@@ -25,10 +25,18 @@ export const DEFAULTS = {
   wireColor: '#00d878', jointColor: '#ff4060', aura: 0.02,
   field: 0.45, waves: 0.4, ambient: 0.7, reflect: 0.2,
   fov: 50, orbitSpeed: 0.15, grid: true, room: true,
-  scenario: 'auto', cycle: 30, dataSource: 'demo', wsUrl: '',
+  scenario: 'auto', cycle: 30, dataSource: 'ws', wsUrl: '',
+  // Room dimensions in metres
+  roomX: 4, roomY: 5,
+  // Sensor node positions in metres (x: 0..roomX, y: 0..roomY, z: height)
+  nodes: [
+    { id: 1, x: 0.5, y: 0.5, z: 1.0, label: 'Node 1 (S3)' },
+    { id: 2, x: 3.5, y: 0.5, z: 1.0, label: 'Node 2 (C6)' },
+    { id: 3, x: 2.0, y: 4.5, z: 1.0, label: 'Node 3 (C6)' },
+  ],
 };
 
-export const SETTINGS_VERSION = '6';
+export const SETTINGS_VERSION = '7';
 
 export const PRESETS = {
   foundation: {},
@@ -281,8 +289,52 @@ export class HudController {
       if (p) this.applyPreset({ ...DEFAULTS, ...p });
     });
 
+    // Room & Nodes section
+    this._bindRoomNodes();
+
     obs._grid.visible = s.grid;
     obs._roomWire.visible = s.room;
+  }
+
+  // ============================================================
+  // Room & Nodes binding
+  // ============================================================
+
+  _bindRoomNodes() {
+    const obs = this._obs;
+    const s = obs.settings;
+
+    // Ensure defensive defaults
+    if (!Number.isFinite(s.roomX) || s.roomX <= 0) s.roomX = DEFAULTS.roomX;
+    if (!Number.isFinite(s.roomY) || s.roomY <= 0) s.roomY = DEFAULTS.roomY;
+    if (!Array.isArray(s.nodes) || s.nodes.length === 0) {
+      s.nodes = DEFAULTS.nodes.map(n => ({ ...n }));
+    }
+
+    const bindNum = (id, getRef, setRef) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.value = getRef();
+      el.addEventListener('input', (e) => {
+        const v = parseFloat(e.target.value);
+        if (Number.isFinite(v)) {
+          setRef(v);
+          if (obs._rebuildRoomAndNodes) obs._rebuildRoomAndNodes();
+          this.saveSettings();
+        }
+      });
+    };
+
+    bindNum('opt-room-x', () => s.roomX, (v) => { s.roomX = v; });
+    bindNum('opt-room-y', () => s.roomY, (v) => { s.roomY = v; });
+
+    for (let i = 0; i < 3; i++) {
+      const idx = i;
+      const node = s.nodes[idx] || (s.nodes[idx] = { ...DEFAULTS.nodes[idx] });
+      bindNum(`opt-node${idx + 1}-x`, () => node.x, (v) => { node.x = v; });
+      bindNum(`opt-node${idx + 1}-y`, () => node.y, (v) => { node.y = v; });
+      bindNum(`opt-node${idx + 1}-z`, () => node.z, (v) => { node.z = v; });
+    }
   }
 
   // ============================================================
@@ -323,6 +375,10 @@ export class HudController {
   applyPreset(preset) {
     const obs = this._obs;
     Object.assign(obs.settings, preset);
+    // Deep-copy nodes so we never alias the DEFAULTS array
+    if (Array.isArray(preset.nodes)) {
+      obs.settings.nodes = preset.nodes.map(n => ({ ...n }));
+    }
     this.saveSettings();
     const rangeMap = {
       'opt-bloom': 'bloom', 'opt-bloom-radius': 'bloomRadius', 'opt-bloom-thresh': 'bloomThresh',
@@ -353,6 +409,21 @@ export class HudController {
     obs._camera.updateProjectionMatrix();
     obs._demoData.setCycleDuration(obs.settings.cycle);
     obs._applyColors();
+
+    // Refresh Room & Nodes inputs and rebuild markers if those keys changed
+    if (preset.roomX !== undefined || preset.roomY !== undefined || preset.nodes) {
+      const setVal = (id, v) => { const el = document.getElementById(id); if (el && Number.isFinite(v)) el.value = v; };
+      setVal('opt-room-x', obs.settings.roomX);
+      setVal('opt-room-y', obs.settings.roomY);
+      const nodes = obs.settings.nodes || [];
+      for (let i = 0; i < 3; i++) {
+        const n = nodes[i] || {};
+        setVal(`opt-node${i + 1}-x`, n.x);
+        setVal(`opt-node${i + 1}-y`, n.y);
+        setVal(`opt-node${i + 1}-z`, n.z);
+      }
+      if (obs._rebuildRoomAndNodes) obs._rebuildRoomAndNodes();
+    }
   }
 
   // ============================================================
