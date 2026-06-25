@@ -6,7 +6,7 @@
 // deletes ALL old caches, so a single reload flushes any stale content left
 // over from the old cache-first worker.
 
-const CACHE_NAME = 'ruview-v3';
+const CACHE_NAME = 'ruview-v4';
 
 // Install — take over as soon as possible.
 self.addEventListener('install', () => {
@@ -19,6 +19,11 @@ self.addEventListener('activate', (event) => {
     const keys = await caches.keys();
     await Promise.all(keys.map((k) => caches.delete(k)));
     await self.clients.claim();
+    // Force any open pages to reload once so they immediately pick up fresh
+    // assets after this worker takes over — turns the old "needs 2 reloads /
+    // clear cache" trap into a single reload. Fires once per worker version.
+    const clients = await self.clients.matchAll({ type: 'window' });
+    for (const c of clients) { try { c.navigate(c.url); } catch {} }
   })());
 });
 
