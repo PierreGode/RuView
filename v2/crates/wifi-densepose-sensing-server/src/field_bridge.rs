@@ -30,11 +30,22 @@ const ENERGY_THRESH_3: f64 = 25.0;
 /// reliable — genuine higher counts come from the multistatic fusion path.
 const MAX_SINGLE_LINK_OCCUPANCY: usize = 3;
 
-/// Create a FieldModelConfig for single-link mode (one ESP32 node = one link).
-/// This avoids the DimensionMismatch error when feeding single-frame observations.
-pub fn single_link_config() -> FieldModelConfig {
+/// Create a FieldModelConfig for single-link mode (one ESP32 node = one link),
+/// sized to the actual CSI subcarrier width of the frames that will be fed.
+///
+/// `n_subcarriers` MUST equal the width of the incoming CSI frames (ESP32-S3
+/// HT40 = 256, ESP32-C6 = 64, ...). The previous code left this at the
+/// `FieldModelConfig::default()` value of 56, so `feed_calibration` rejected
+/// every real frame and calibration never collected anything.
+///
+/// Also lowers `min_calibration_frames` from the 12_000 long-baseline default
+/// to a value suitable for an interactive (~10-30 s) empty-room baseline,
+/// otherwise `/calibration/stop` can never finalise.
+pub fn single_link_config(n_subcarriers: usize) -> FieldModelConfig {
     FieldModelConfig {
         n_links: 1,
+        n_subcarriers,
+        min_calibration_frames: 200,
         ..FieldModelConfig::default()
     }
 }
@@ -113,6 +124,12 @@ pub fn maybe_feed_calibration(field: &mut FieldModel, frame_history: &VecDeque<V
         _ => return,
     }
     if let Some(latest) = frame_history.back() {
+        // Heterogeneous nodes (S3=256, C6=64) feed into one single-link model;
+        // only frames matching the configured width are valid (feed_calibration
+        // would reject the rest with DimensionMismatch). Skip mismatches.
+        if latest.len() != field.n_subcarriers() {
+            return;
+        }
         // Single-link observation: [1][n_subcarriers]
         let observations = vec![latest.clone()];
         if let Err(e) = field.feed_calibration(&observations) {
