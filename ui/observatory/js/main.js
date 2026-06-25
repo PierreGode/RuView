@@ -44,7 +44,12 @@ const ROOM_H = 4;   // scene units (wall height for room wireframe)
 class Observatory {
   constructor() {
     this._canvas = document.getElementById('observatory-canvas');
-    this.settings = { ...DEFAULTS, nodes: DEFAULTS.nodes.map(n => ({ ...n })) };
+    this.settings = {
+      ...DEFAULTS,
+      // Clone the per-node override maps so we never alias DEFAULTS objects.
+      nodeLabels: { ...(DEFAULTS.nodeLabels || {}) },
+      nodePositions: { ...(DEFAULTS.nodePositions || {}) },
+    };
 
     // Load saved settings
     try {
@@ -267,67 +272,103 @@ class Observatory {
 
   // ---- Sensor Nodes ----
 
-  _safeNodes() {
-    let nodes = this.settings.nodes;
-    if (!Array.isArray(nodes) || nodes.length === 0) {
-      nodes = DEFAULTS.nodes.map(n => ({ ...n }));
-      this.settings.nodes = nodes;
-    }
-    return nodes;
-  }
-
   _buildNodes() {
+    // Nodes are fully dynamic — markers are created/removed to match the set of
+    // node_ids currently reporting in the live feed (see _syncNodes, driven from
+    // the animate loop). Start empty; nothing is hardcoded.
     this._nodeGroup = new THREE.Group();
     this._scene.add(this._nodeGroup);
-    this._nodeMarkers = [];
+    this._nodeMarkers = [];   // [{ group, led, light, scenePos, nodeId }]
+    this._nodeIdKey = '';     // signature of the rendered id set (change detect)
+  }
 
-    const nodes = this._safeNodes();
-    nodes.forEach((node, i) => {
-      const def = DEFAULTS.nodes[i] || DEFAULTS.nodes[0];
-      const g = new THREE.Group();
-      const p = this._roomToScene(node.x ?? def.x, node.y ?? def.y, node.z ?? def.z);
-      g.position.copy(p);
+  // Room-space position (metres) for a node: user-tagged override if present,
+  // else auto-layout — spread the N reporting nodes evenly around the room so
+  // they don't overlap. Hardware-agnostic; only node id matters.
+  _nodeRoomPos(id, idx, total) {
+    const tag = this.settings.nodePositions && this.settings.nodePositions[id];
+    if (tag && Number.isFinite(+tag.x) && Number.isFinite(+tag.y)) {
+      return { x: +tag.x, y: +tag.y, z: Number.isFinite(+tag.z) ? +tag.z : 1 };
+    }
+    return this._autoLayoutPos(idx, total);
+  }
 
-      // Emissive marker box
-      const boxGeo = new THREE.BoxGeometry(0.28, 0.12, 0.2);
-      const boxMat = new THREE.MeshStandardMaterial({
-        color: 0x303848, roughness: 0.3, metalness: 0.6,
-        emissive: C.blueSignal, emissiveIntensity: 0.6,
-      });
-      g.add(new THREE.Mesh(boxGeo, boxMat));
+  // Pure auto-layout (no per-node override): spread `total` nodes evenly around
+  // an inset ellipse on the room floor. Also used by the settings node-list so
+  // the displayed default positions match the scene.
+  _autoLayoutPos(idx, total) {
+    const rx = +this.settings.roomX || 4;
+    const ry = +this.settings.roomY || 5;
+    const ang = (total > 0 ? idx / total : 0) * Math.PI * 2 - Math.PI / 2;
+    return { x: rx / 2 + Math.cos(ang) * rx * 0.38, y: ry / 2 + Math.sin(ang) * ry * 0.38, z: 1 };
+  }
 
-      // Short vertical antenna
-      const antGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.3);
-      const antMat = new THREE.MeshStandardMaterial({
-        color: 0x90b0ff, roughness: 0.3, metalness: 0.6,
-        emissive: C.blueSignal, emissiveIntensity: 0.4,
-      });
-      const ant = new THREE.Mesh(antGeo, antMat);
-      ant.position.set(0, 0.21, 0);
-      g.add(ant);
+  _nodeLabel(id) {
+    const t = this.settings.nodeLabels && this.settings.nodeLabels[id];
+    return (t && String(t).trim()) ? String(t) : `Node ${id}`;
+  }
 
-      // Pulsing LED tip
-      const led = new THREE.Mesh(
-        new THREE.SphereGeometry(0.03),
-        new THREE.MeshBasicMaterial({ color: C.greenGlow })
-      );
-      led.position.set(0, 0.37, 0);
-      g.add(led);
+  _makeNodeMarker(id, idx, total) {
+    const g = new THREE.Group();
+    const rp = this._nodeRoomPos(id, idx, total);
+    const p = this._roomToScene(rp.x, rp.y, rp.z);
+    g.position.copy(p);
 
-      // Point light for local glow
-      const light = new THREE.PointLight(C.blueSignal, 0.8, 4);
-      light.position.set(0, 0.3, 0);
-      g.add(light);
-
-      // Floating text label
-      const label = this._makeLabelSprite(node.label || def.label || `Node ${i + 1}`, '#90c0ff');
-      label.position.set(0, 0.7, 0);
-      label.scale.set(1.6, 0.4, 1);
-      g.add(label);
-
-      this._nodeGroup.add(g);
-      this._nodeMarkers.push({ group: g, led, light, scenePos: p.clone(), nodeId: node.id ?? (i + 1) });
+    const boxMat = new THREE.MeshStandardMaterial({
+      color: 0x303848, roughness: 0.3, metalness: 0.6,
+      emissive: C.blueSignal, emissiveIntensity: 0.6,
     });
+    g.add(new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.12, 0.2), boxMat));
+
+    const antMat = new THREE.MeshStandardMaterial({
+      color: 0x90b0ff, roughness: 0.3, metalness: 0.6,
+      emissive: C.blueSignal, emissiveIntensity: 0.4,
+    });
+    const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.3), antMat);
+    ant.position.set(0, 0.21, 0);
+    g.add(ant);
+
+    const led = new THREE.Mesh(new THREE.SphereGeometry(0.03), new THREE.MeshBasicMaterial({ color: C.greenGlow }));
+    led.position.set(0, 0.37, 0);
+    g.add(led);
+
+    const light = new THREE.PointLight(C.blueSignal, 0.8, 4);
+    light.position.set(0, 0.3, 0);
+    g.add(light);
+
+    const label = this._makeLabelSprite(this._nodeLabel(id), '#90c0ff');
+    label.position.set(0, 0.7, 0);
+    label.scale.set(1.6, 0.4, 1);
+    g.add(label);
+
+    this._nodeGroup.add(g);
+    return { group: g, led, light, scenePos: p.clone(), nodeId: id };
+  }
+
+  // Reconcile rendered markers to `ids` (the node_ids currently reporting).
+  // Cheap change-detect via a joined key; full rebuild only when the set changes
+  // (or force=true after a settings edit) so per-frame cost is ~nil.
+  _syncNodes(ids, force = false) {
+    if (!this._nodeGroup) return;
+    const list = (Array.isArray(ids) ? ids : []).filter(v => v != null);
+    const key = list.join(',');
+    if (!force && key === this._nodeIdKey) return;
+    this._nodeIdKey = key;
+
+    // Dispose current markers, then rebuild for the new set (keeps auto-layout
+    // consistent as the count changes).
+    this._nodeGroup.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) { o.material.map?.dispose?.(); o.material.dispose?.(); }
+    });
+    this._nodeGroup.clear();
+    this._nodeMarkers = list.map((id, idx) => this._makeNodeMarker(id, idx, list.length));
+    this._rebuildWifiWaves();
+    // Refresh the settings "Room & Nodes" list to match (it has its own
+    // change-detection; cheap to call). Guarded so it can't break the scene.
+    try { this._hud && this._hud.refreshNodeList(); } catch (e) {
+      if (!this._nodeListErrLogged) { console.error('[Observatory] refreshNodeList failed:', e); this._nodeListErrLogged = true; }
+    }
   }
 
   // Build a CanvasTexture text sprite for a node/dimension label
@@ -354,15 +395,9 @@ class Observatory {
   // Live re-place room + node markers when settings change (no reload)
   _rebuildRoomAndNodes() {
     this._refreshRoomDimLabels();
-    if (this._nodeGroup) {
-      this._scene.remove(this._nodeGroup);
-      this._nodeGroup.traverse(o => {
-        if (o.geometry) o.geometry.dispose();
-        if (o.material) { o.material.map?.dispose(); o.material.dispose(); }
-      });
-    }
-    this._buildNodes();
-    this._rebuildWifiWaves();
+    // Re-place/relabel the currently-rendered nodes with the new settings.
+    const ids = (this._nodeMarkers || []).map(m => m.nodeId);
+    this._syncNodes(ids, true);
   }
 
   // ---- WiFi Waves (one ripple set per node) ----
@@ -680,13 +715,15 @@ class Observatory {
       }
     }
 
-    // Node markers: pulse LEDs, and show ONLY nodes present in the live feed
-    // (data.nodes[].node_id). With no live data (demo), show all configured.
+    // Reconcile markers to the node_ids currently reporting (one marker per
+    // reporting node, any count), then pulse their LEDs. No live nodes -> none.
+    const reportIds = this._connIds ? [...this._connIds] : [];
+    try { this._syncNodes(reportIds); } catch (e) {
+      if (!this._syncErrLogged) { console.error('[Observatory] _syncNodes failed:', e); this._syncErrLogged = true; }
+    }
     if (this._nodeMarkers) {
-      const connIds = this._connIds;
       for (let i = 0; i < this._nodeMarkers.length; i++) {
         const m = this._nodeMarkers[i];
-        if (connIds) m.group.visible = connIds.has(m.nodeId);
         const ph = i * 1.3;
         m.led.material.opacity = 0.5 + 0.5 * Math.sin(elapsed * 8 + ph);
         m.light.intensity = 0.4 + 0.3 * Math.sin(elapsed * 3 + ph);
