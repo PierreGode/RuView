@@ -1,7 +1,7 @@
 // RuView Service Worker - Offline caching for the dashboard shell
 // Strategy: Network-first for API calls, Cache-first for static assets
 
-const CACHE_NAME = 'ruview-v1';
+const CACHE_NAME = 'ruview-v2';
 const SHELL_ASSETS = [
   '/',
   '/index.html',
