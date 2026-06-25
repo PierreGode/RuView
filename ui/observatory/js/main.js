@@ -108,7 +108,7 @@ class Observatory {
     this._setupLighting();
     this._nebula = new NebulaBackground(this._scene);
     this._buildRoom();
-    this._buildNodes();
+    try { this._buildNodes(); } catch (e) { console.error('[Observatory] _buildNodes failed (continuing):', e); }
     this._poseSystem = new PoseSystem();
     this._figurePool = new FigurePool(this._scene, this.settings, this._poseSystem);
     this._scenarioProps = new ScenarioProps(this._scene);
@@ -133,19 +133,20 @@ class Observatory {
     this._showFps = false;
     this._qualityLevel = 2;
 
-    // WebSocket for live data — always try auto-detect on startup
-    this._ws = null;
-    this._liveData = null;
-    this._autoDetectLive();
-
-    // Input
+    // Wire input + settings UI and start the loop FIRST, so the page is always
+    // interactive even if data/auto-detect below throws (an init exception here
+    // previously left the Settings button unwired and the page frozen).
     this._initKeyboard();
     this._hud.initSettings();
     this._hud.initQuickSelect();
     window.addEventListener('resize', () => this._onResize());
 
-    // Start
+    this._ws = null;
+    this._liveData = null;
     this._animate();
+
+    // Auto-detect live data last, guarded so a failure can't break init.
+    try { this._autoDetectLive(); } catch (e) { console.error('[Observatory] _autoDetectLive failed (continuing):', e); }
   }
 
   // ---- Lighting ----
@@ -325,7 +326,7 @@ class Observatory {
       g.add(label);
 
       this._nodeGroup.add(g);
-      this._nodeMarkers.push({ group: g, led, light, scenePos: p.clone() });
+      this._nodeMarkers.push({ group: g, led, light, scenePos: p.clone(), nodeId: node.id ?? (i + 1) });
     });
   }
 
@@ -653,21 +654,35 @@ class Observatory {
     }
     const data = this._currentData;
 
-    // Updates
-    this._nebula.update(dt, elapsed);
-    this._figurePool.update(data, elapsed);
-    this._scenarioProps.update(data, this._demoData.currentScenario);
-    this._updateDotMatrixMist(data, elapsed);
-    this._updateParticleTrail(data, dt, elapsed);
-    this._updateWifiWaves(elapsed);
-    this._updateSignalField(data);
-    this._hud.updateHUD(data, this._demoData);
-    this._hud.updateSparkline(data);
+    // Updates (guarded: a single updater throwing on an unexpected live-data
+    // shape must not abort the frame — otherwise controls/render below are
+    // skipped and the page freezes).
+    try {
+      this._nebula.update(dt, elapsed);
+      this._figurePool.update(data, elapsed);
+      this._scenarioProps.update(data, this._demoData.currentScenario);
+      this._updateDotMatrixMist(data, elapsed);
+      this._updateParticleTrail(data, dt, elapsed);
+      this._updateWifiWaves(elapsed);
+      this._updateSignalField(data);
+      this._hud.updateHUD(data, this._demoData);
+      this._hud.updateSparkline(data);
+    } catch (e) {
+      if (!this._loopErrLogged) {
+        console.error('[Observatory] per-frame update error (loop kept alive):', e);
+        this._loopErrLogged = true;
+      }
+    }
 
-    // Node LEDs pulse
+    // Node markers: pulse LEDs, and show ONLY nodes present in the live feed
+    // (data.nodes[].node_id). With no live data (demo), show all configured.
     if (this._nodeMarkers) {
+      const connIds = (data && Array.isArray(data.nodes))
+        ? new Set(data.nodes.map(n => n.node_id))
+        : null;
       for (let i = 0; i < this._nodeMarkers.length; i++) {
         const m = this._nodeMarkers[i];
+        if (connIds) m.group.visible = connIds.has(m.nodeId);
         const ph = i * 1.3;
         m.led.material.opacity = 0.5 + 0.5 * Math.sin(elapsed * 8 + ph);
         m.light.intensity = 0.4 + 0.3 * Math.sin(elapsed * 3 + ph);
