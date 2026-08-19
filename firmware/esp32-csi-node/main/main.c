@@ -19,6 +19,7 @@
 #include "esp_app_desc.h"
 #include "sdkconfig.h"
 #include "led_strip.h"
+#include "driver/gpio.h"
 
 #include "csi_collector.h"
 #include "stream_sender.h"
@@ -67,6 +68,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "WiFi disconnected, reason=%d rssi=%d", disc->reason, disc->rssi);
         if (s_retry_num < MAX_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
@@ -102,13 +105,18 @@ static void wifi_init_sta(void)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            /* WPA_PSK (not WPA2_PSK) so routers running WPA/WPA2-mixed
+             * compatibility mode aren't rejected with
+             * WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD (#1050). */
+            .threshold.authmode = WIFI_AUTH_WPA_PSK,
         },
     };
 
     /* Copy runtime SSID/password from NVS config */
-    strncpy((char *)wifi_config.sta.ssid, g_nvs_config.wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, g_nvs_config.wifi_password, sizeof(wifi_config.sta.password) - 1);
+    strlcpy((char *)wifi_config.sta.ssid, g_nvs_config.wifi_ssid,
+            sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, g_nvs_config.wifi_password,
+            sizeof(wifi_config.sta.password));
 
     /* If password is empty, use open auth */
     if (strlen((char *)wifi_config.sta.password) == 0) {
@@ -209,6 +217,25 @@ void app_main(void)
      * g_nvs_config. See #232/#375/#390: WiFi driver init clobbers the struct
      * on some devices, reverting node_id to the Kconfig default of 1. */
     csi_collector_set_node_id(g_nvs_config.node_id);
+
+    /* Seeed XIAO ESP32-C6 antenna select — must run BEFORE any radio init so
+     * the first RF activity already uses the chosen path. The XIAO-C6 has a
+     * software RF switch: GPIO3 powers it, GPIO14 selects on-board (LOW) vs the
+     * external u.FL/IPEX socket (HIGH). Choice comes from NVS (cfg->ext_antenna,
+     * set by the flasher's "external u.FL antenna" checkbox; Kconfig sets the
+     * default). Compiled only on ESP32-C6; a no-op on S3. Note: external only
+     * helps with an antenna actually attached to the u.FL connector. */
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+    {
+        const bool ext_ant = g_nvs_config.ext_antenna != 0;
+        gpio_set_direction(GPIO_NUM_3, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_NUM_3, 0);                     /* power/enable the RF switch */
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_direction(GPIO_NUM_14, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_NUM_14, ext_ant ? 1 : 0);      /* 1 = external u.FL, 0 = on-board */
+        ESP_LOGI(TAG, "XIAO ESP32-C6 antenna: %s", ext_ant ? "external u.FL" : "on-board");
+    }
+#endif
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
 #if defined(CONFIG_IDF_TARGET_ESP32C6)
@@ -426,9 +453,12 @@ void app_main(void)
             .ingest_sec    = g_nvs_config.swarm_ingest_sec,
             .enabled       = 1,
         };
-        strncpy(swarm_cfg.seed_url, g_nvs_config.seed_url, sizeof(swarm_cfg.seed_url) - 1);
-        strncpy(swarm_cfg.seed_token, g_nvs_config.seed_token, sizeof(swarm_cfg.seed_token) - 1);
-        strncpy(swarm_cfg.zone_name, g_nvs_config.zone_name, sizeof(swarm_cfg.zone_name) - 1);
+        strlcpy(swarm_cfg.seed_url, g_nvs_config.seed_url,
+                sizeof(swarm_cfg.seed_url));
+        strlcpy(swarm_cfg.seed_token, g_nvs_config.seed_token,
+                sizeof(swarm_cfg.seed_token));
+        strlcpy(swarm_cfg.zone_name, g_nvs_config.zone_name,
+                sizeof(swarm_cfg.zone_name));
         swarm_ret = swarm_bridge_init(&swarm_cfg, csi_collector_get_node_id());
         if (swarm_ret != ESP_OK) {
             ESP_LOGW(TAG, "Swarm bridge init failed: %s", esp_err_to_name(swarm_ret));
@@ -492,6 +522,15 @@ void app_main(void)
      * dedicated SPI host — it does NOT cause the QSPI/flash-cache contention the
      * MGMT-only workaround (RuView#396/#893) was guarding the AMOLED against. So
      * keep full MGMT+DATA capture for proper CSI yield even with the display on. */
+    has_display = false;
+#endif
+#ifdef CONFIG_CSI_FORCE_DATA_CAPTURE
+    /* Sensing-quality override: the AMOLED build normally captures MGMT-only
+     * (self-ping OFDM floor keeps yield alive), but a single node↔router link is
+     * a poor sensing channel — empty vs occupied is nearly indistinguishable. This
+     * forces MGMT+DATA promiscuous even on the AMOLED so the CSI sees the room's
+     * multipath. Trades against the #893 QSPI/flash-cache contention the AMOLED
+     * guard was avoiding — watch for display glitches / dropped CSI. */
     has_display = false;
 #endif
     if (!has_display) {

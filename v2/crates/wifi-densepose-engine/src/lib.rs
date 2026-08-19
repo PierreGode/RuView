@@ -198,13 +198,45 @@ impl RecalibrationAdvisor {
     }
 }
 
+/// Build the multistatic fusion config for the governed trust cycle, honoring
+/// the `WDP_GUARD_INTERVAL_US` / `WDP_SOFT_GUARD_US` overrides (issue #1049).
+///
+/// WiFi/ESP-NOW-synced ESP32 nodes drift 10-150 ms, which exceeds the 60 ms
+/// default guard and makes every governed cycle fail with a timestamp-spread
+/// error (source -> offline). The sensing-server binary already applies this
+/// override to the *bare* fuser; without it here the trust-cycle fuser stayed
+/// pinned at 60 ms and the override never reached the live path. Same precedence
+/// as the binary: a direct hard-guard override on top of the default, with the
+/// soft band kept strictly below the (possibly raised) hard guard.
+fn multistatic_config_from_env() -> MultistaticConfig {
+    let mut cfg = MultistaticConfig::default();
+    if let Some(g) = std::env::var("WDP_GUARD_INTERVAL_US")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&g| g >= 1)
+    {
+        cfg.guard_interval_us = g;
+        if cfg.soft_guard_us >= g {
+            cfg.soft_guard_us = g.saturating_sub(1).max(1);
+        }
+    }
+    if let Some(s) = std::env::var("WDP_SOFT_GUARD_US")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s >= 1)
+    {
+        cfg.soft_guard_us = s.min(cfg.guard_interval_us.saturating_sub(1).max(1));
+    }
+    cfg
+}
+
 impl StreamingEngine {
     /// Build an engine with a starting privacy mode and model version. The
     /// WorldGraph is registered to the installation origin.
     #[must_use]
     pub fn new(mode: PrivacyMode, model_version: u16, registration: GeoRegistration) -> Self {
         Self {
-            fuser: MultistaticFuser::with_config(MultistaticConfig::default()),
+            fuser: MultistaticFuser::with_config(multistatic_config_from_env()),
             coherence_accept: Self::DEFAULT_COHERENCE_ACCEPT,
             privacy: PrivacyModeRegistry::new(mode),
             world: WorldGraph::new(registration),
@@ -224,6 +256,19 @@ impl StreamingEngine {
             recal: RecalibrationAdvisor::default(),
             mesh: MeshGuard::default(),
         }
+    }
+
+    /// Override the multistatic fuser's timestamp guard interval (#1049/#1057).
+    /// Without this, `StreamingEngine::new` always builds
+    /// `MultistaticFuser::with_config(MultistaticConfig::default())` — a
+    /// hardcoded 60 ms hard guard that ignores whatever schedule/override the
+    /// caller derived from `WDP_TDM_SLOTS`/`WDP_GUARD_INTERVAL_US`, so
+    /// WiFi/ESP-NOW-synced multi-node deployments spuriously fail governed
+    /// trust cycles even after widening the guard elsewhere.
+    ///
+    /// Rebuilds the fuser, so call before any frames are processed.
+    pub fn set_multistatic_config(&mut self, cfg: MultistaticConfig) {
+        self.fuser = MultistaticFuser::with_config(cfg);
     }
 
     /// Activate a per-room calibration adapter (ADR-150 §3.4). From the next
