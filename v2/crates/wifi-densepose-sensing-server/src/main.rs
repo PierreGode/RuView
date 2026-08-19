@@ -4853,6 +4853,22 @@ static NODE_MOTION_BASELINE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<u8, f64>>,
 > = std::sync::OnceLock::new();
 
+/// Temporal-smoothing state for the activity centroid: the last emitted
+/// position, EMA-blended each frame so the blob drifts calmly instead of
+/// twitching. `None` between presences (reset when the room goes absent) so a
+/// returning person doesn't get dragged from a stale spot.
+static SMOOTHED_POSITION: std::sync::OnceLock<std::sync::Mutex<Option<[f64; 3]>>> =
+    std::sync::OnceLock::new();
+
+/// Clear the centroid smoothing state (called when the room goes absent).
+fn reset_centroid_smoothing() {
+    if let Some(cell) = SMOOTHED_POSITION.get() {
+        if let Ok(mut sp) = cell.lock() {
+            *sp = None;
+        }
+    }
+}
+
 /// Coarse "activity centroid" position for the Observatory figure (issue #1050
 /// follow-up). Places the person at the per-node **motion-weighted centroid** of
 /// the configured node positions, so the blob drifts toward whichever node
@@ -4930,7 +4946,24 @@ fn node_activity_centroid(update: &SensingUpdate) -> Option<[f64; 3]> {
     if !(wsum > 0.0) {
         return None;
     }
-    Some([acc[0] / wsum, acc[1] / wsum, acc[2] / wsum])
+    let raw = [acc[0] / wsum, acc[1] / wsum, acc[2] / wsum];
+
+    // Temporal smoothing: EMA-blend toward the raw centroid so the blob drifts
+    // calmly instead of snapping every frame. `RUVIEW_LOCALIZE_SMOOTH` in [0,1]
+    // (default 0.08 — gentle; higher = more responsive/twitchier, 1.0 = off).
+    let smooth = env_f("RUVIEW_LOCALIZE_SMOOTH", 0.08).clamp(0.0, 1.0);
+    let cell = SMOOTHED_POSITION.get_or_init(|| std::sync::Mutex::new(None));
+    let mut sp = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let out = match *sp {
+        Some(prev) if smooth > 0.0 && smooth < 1.0 => [
+            prev[0] + smooth * (raw[0] - prev[0]),
+            prev[1] + smooth * (raw[1] - prev[1]),
+            prev[2] + smooth * (raw[2] - prev[2]),
+        ],
+        _ => raw,
+    };
+    *sp = Some(out);
+    Some(out)
 }
 
 fn attach_field_positions(update: &mut SensingUpdate) {
@@ -4943,6 +4976,9 @@ fn attach_field_positions(update: &mut SensingUpdate) {
         for v in update.signal_field.values.iter_mut() {
             *v = 0.0;
         }
+        // Room empty — forget the smoothed blob position so a returning person
+        // isn't dragged in from wherever it was last parked.
+        reset_centroid_smoothing();
     }
     // Compute the coarse multi-node activity centroid up-front, while only a
     // shared borrow of `update` is held — it must precede the &mut persons borrow.
